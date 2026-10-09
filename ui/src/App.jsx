@@ -1,27 +1,14 @@
-import { Routes, Route, useNavigate } from "react-router-dom";
-import { useEffect } from "react";
-
+import { useEffect, useState } from "react";
 import SplashScreen from "./components/SplashScreen";
 import Dashboard from "./pages/Dashboard";
 
-function SplashWrapper() {
-  const navigate = useNavigate();
+export default function App() {
+  const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    const timer = setTimeout(() => {
-      navigate("/dashboard");
-    }, 3000);
-    return () => clearTimeout(timer);
+    const timer = window.setTimeout(() => setReady(true), 1600);
+    return () => window.clearTimeout(timer);
   }, []);
 
-  return <SplashScreen onFinish={() => navigate("/dashboard")} />;
-}
-
-export default function App() {
-  return (
-    <Routes>
-      <Route path="/"          element={<SplashWrapper />} />
-      <Route path="/dashboard" element={<Dashboard />} />
-    </Routes>
-  );
+  return ready ? <Dashboard /> : <SplashScreen onFinish={() => setReady(true)} />;
 }

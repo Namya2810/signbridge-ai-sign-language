@@ -1,272 +1,351 @@
-"""
-SignBridge Backend — FastAPI + WebSocket
-----------------------------------------
-React frontend isse connect karta hai.
-Endpoints:
-  WS  /ws/predict   — camera frames aate hain, predictions jaate hain
-  POST /tts          — sentence bhejo, TTS se bolwao
-  POST /stt/start    — mic recording shuru karo
-  GET  /stt/result   — transcription result lo
-  GET  /status       — backend alive hai ya nahi
-"""
+"""Reliable FastAPI backend for SignBridge."""
+
+from __future__ import annotations
 
 import asyncio
 import base64
-import io
+import logging
+import os
 import pickle
-import threading
-import time
+from contextlib import asynccontextmanager
+from pathlib import Path
+from threading import Lock, Thread
+from typing import Any
 
 import cv2
 import numpy as np
-import pyttsx3
-import sounddevice as sd
-import uvicorn
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
-from scipy.io.wavfile import write as wav_write
-from faster_whisper import WhisperModel
-import tensorflow as tf
+from pydantic import BaseModel
 
-# ─── App setup ───────────────────────────────────────────────────────────────
-app = FastAPI(title="SignBridge API")
+from recognition import PredictionSmoother, WordFormer, preprocess_frame
 
-# React (localhost:5173) ko allow karo
+LOGGER = logging.getLogger("signbridge")
+logging.basicConfig(level=os.getenv("SIGNBRIDGE_LOG_LEVEL", "INFO"))
+
+BASE_DIR = Path(__file__).resolve().parent
+MODEL_PATH = Path(os.getenv("SIGNBRIDGE_MODEL", BASE_DIR / "sign_model_grey.keras"))
+ENCODER_PATH = Path(os.getenv("SIGNBRIDGE_ENCODER", BASE_DIR / "label_encoder_grey.pkl"))
+MAX_FRAME_BYTES = 2_500_000
+
+
+class Runtime:
+    model: Any = None
+    encoder: Any = None
+    model_error: str | None = None
+    input_size = (64, 64)
+    predict_lock = Lock()
+    state_lock = Lock()
+    detector_lock = Lock()
+    words = WordFormer()
+    hand_detector: Any = None
+    tts_lock = Lock()
+    tts_busy = False
+    stt_lock = Lock()
+    stt_status = "idle"
+    stt_result = ""
+    stt_error = ""
+    whisper: Any = None
+
+
+runtime = Runtime()
+
+
+def load_recognition_model() -> None:
+    """Load model assets without making the whole API crash on failure."""
+    try:
+        if not MODEL_PATH.is_file():
+            raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
+        if not ENCODER_PATH.is_file():
+            raise FileNotFoundError(f"Label encoder not found: {ENCODER_PATH}")
+
+        os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "2")
+        import tensorflow as tf
+
+        runtime.model = tf.keras.models.load_model(MODEL_PATH, compile=False)
+        with ENCODER_PATH.open("rb") as handle:
+            runtime.encoder = pickle.load(handle)
+
+        shape = runtime.model.input_shape
+        if not isinstance(shape, tuple) or len(shape) != 4:
+            raise ValueError(f"Unsupported model input shape: {shape}")
+        runtime.input_size = (int(shape[2]), int(shape[1]))
+        output_classes = int(runtime.model.output_shape[-1])
+        if output_classes != len(runtime.encoder.classes_):
+            raise ValueError(
+                f"Model has {output_classes} outputs but encoder has "
+                f"{len(runtime.encoder.classes_)} classes"
+            )
+        runtime.model_error = None
+        try:
+            import mediapipe as mp
+
+            runtime.hand_detector = mp.solutions.hands.Hands(
+                static_image_mode=False,
+                max_num_hands=2,
+                min_detection_confidence=0.65,
+                min_tracking_confidence=0.6,
+            )
+        except Exception:
+            runtime.hand_detector = None
+            LOGGER.exception("MediaPipe hand tracking is unavailable")
+        LOGGER.info("Recognition model ready with %s classes", output_classes)
+    except Exception as exc:
+        runtime.model = None
+        runtime.encoder = None
+        runtime.model_error = str(exc)
+        LOGGER.exception("Recognition model could not be loaded")
+
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    await asyncio.to_thread(load_recognition_model)
+    yield
+
+
+app = FastAPI(title="SignBridge API", version="3.0", lifespan=lifespan)
+origins = os.getenv(
+    "SIGNBRIDGE_CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173"
+).split(",")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:5174"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=[origin.strip() for origin in origins if origin.strip()],
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type"],
 )
 
-# ─── Load CNN model ──────────────────────────────────────────────────────────
-print("CNN model load ho raha hai...")
-cnn_model = tf.keras.models.load_model("sign_model_grey.keras")
-with open("label_encoder_grey.pkl", "rb") as f:
-    le = pickle.load(f)
-print(f"CNN model loaded. Classes: {len(le.classes_)}")
 
-# ─── Load Whisper model ───────────────────────────────────────────────────────
-print("Whisper model load ho raha hai (pehli baar slow hoga)...")
-whisper_model = WhisperModel("small", compute_type="int8")
-print("Whisper loaded.")
+class TextRequest(BaseModel):
+    text: str
 
-# ─── TTS engine ──────────────────────────────────────────────────────────────
-tts_engine  = pyttsx3.init("sapi5")
-tts_engine.setProperty("rate", 160)
-tts_lock    = threading.Lock()
-tts_busy    = False
 
-def _speak(text: str):
-    global tts_busy
-    with tts_lock:
-        tts_busy = True
-        tts_engine.say(text)
-        tts_engine.runAndWait()
-        tts_busy = False
+def locate_hand(frame: np.ndarray) -> tuple[np.ndarray, bool]:
+    """Return a quality-checked crop containing every detected hand.
 
-# ─── STT state ───────────────────────────────────────────────────────────────
-FS             = 16000
-RECORD_SECS    = 6
-stt_status     = "idle"        # idle | recording | processing | done
-stt_result     = ""
-stt_audio      = None
+    Several bundled ISL reference signs use two hands. Cropping only the first
+    hand removes important shape information and makes the CNN guess. Tiny or
+    mostly off-frame detections are rejected before classification as well.
+    """
+    if runtime.hand_detector is None:
+        # Never guess hand presence from generic image edges: faces, curtains,
+        # and furniture otherwise become high-confidence false gestures.
+        return frame, False
 
-def _record_and_transcribe():
-    global stt_status, stt_result, stt_audio
-    stt_status = "recording"
-    stt_audio  = sd.rec(int(RECORD_SECS * FS), samplerate=FS,
-                        channels=1, dtype="int16")
-    sd.wait()
-    stt_status = "processing"
-    wav_write("recorded.wav", FS, stt_audio)
-    segments, _ = whisper_model.transcribe(
-        "recorded.wav", beam_size=5, temperature=0.0, vad_filter=True
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    with runtime.detector_lock:
+        result = runtime.hand_detector.process(rgb)
+    if not result.multi_hand_landmarks:
+        return frame, False
+
+    height, width = frame.shape[:2]
+    points = [
+        point
+        for hand_landmarks in result.multi_hand_landmarks
+        for point in hand_landmarks.landmark
+    ]
+    xs = [point.x * width for point in points]
+    ys = [point.y * height for point in points]
+    x0, x1 = min(xs), max(xs)
+    y0, y1 = min(ys), max(ys)
+    box_width = x1 - x0
+    box_height = y1 - y0
+    box_area_ratio = (box_width * box_height) / max(width * height, 1)
+    center_x = ((x0 + x1) / 2) / width
+    center_y = ((y0 + y1) / 2) / height
+    in_frame = sum(0 <= point.x <= 1 and 0 <= point.y <= 1 for point in points)
+    quality_ok = (
+        box_width >= width * 0.09
+        and box_height >= height * 0.11
+        and box_area_ratio >= 0.014
+        and 0.16 <= center_x <= 0.84
+        and 0.08 <= center_y <= 0.94
+        and in_frame >= len(points) - 2
     )
-    text = " ".join(s.text for s in segments).strip()
-    stt_result = text if len(text) >= 2 else ""
-    stt_status = "done"
-    print(f"STT result: {stt_result}")
+    if not quality_ok:
+        return frame, False
 
-# ─── Word Formation state (same logic as week4) ──────────────────────────────
-CONF_THRESHOLD  = 0.55
-EDGE_THRESHOLD  = 0.015
-STABILITY_TIME  = 2.0
-SPACE_TIME      = 3.0
+    side = max(box_width, box_height) * 1.7
+    cx, cy = (x0 + x1) / 2, (y0 + y1) / 2
+    left = max(int(cx - side / 2), 0)
+    top = max(int(cy - side / 2), 0)
+    right = min(int(cx + side / 2), width)
+    bottom = min(int(cy + side / 2), height)
+    return frame[top:bottom, left:right], right > left and bottom > top
 
-wf_state = {
-    "current_sentence" : "",
-    "current_letter"   : "",
-    "stable_since"     : None,
-    "last_hand_time"   : time.time(),
-    "letter_just_added": False,
-    "last_pred_letter" : "",
-    "last_confidence"  : 0.0,
-    "hand_present"     : False,
-}
 
-def process_frame(frame_bgr: np.ndarray) -> dict:
-    """
-    Ek frame lo, predict karo, word formation update karo.
-    Returns dict jo frontend ko JSON mein bheja jayega.
-    """
-    s   = wf_state
-    now = time.time()
+def predict_probabilities(frame: np.ndarray) -> tuple[np.ndarray | None, bool]:
+    hand_crop, hand_present = locate_hand(frame)
+    if not hand_present:
+        return None, False
+    batch = preprocess_frame(hand_crop, runtime.input_size)
+    with runtime.predict_lock:
+        predictions = runtime.model.predict(batch, verbose=0)
+    return np.asarray(predictions[0], dtype=np.float32), True
 
-    # ── Hand detection ────────────────────────────────────────────────────
-    gray         = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    edges        = cv2.Canny(gray, 50, 150)
-    edge_density = float(np.sum(edges > 0) / edges.size)
-    hand_present = edge_density > EDGE_THRESHOLD
-    s["hand_present"] = hand_present
 
-    pred_letter = s["last_pred_letter"]
-    confidence  = s["last_confidence"]
+def decode_frame(data: str) -> np.ndarray:
+    encoded = data.split(",", 1)[-1]
+    try:
+        raw = base64.b64decode(encoded, validate=True)
+    except ValueError as exc:
+        raise ValueError("Invalid base64 camera frame") from exc
+    if not raw or len(raw) > MAX_FRAME_BYTES:
+        raise ValueError("Camera frame is empty or too large")
+    frame = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if frame is None:
+        raise ValueError("Camera frame is not a valid image")
+    return frame
 
-    # ── Predict ───────────────────────────────────────────────────────────
-    if hand_present:
-        img = cv2.resize(frame_bgr, (64, 64))
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        img = img / 255.0
-        img = np.expand_dims(img, axis=0)
-        preds       = cnn_model.predict(img, verbose=0)
-        confidence  = float(np.max(preds))
-        pred_letter = le.classes_[int(np.argmax(preds))]
-        s["last_pred_letter"] = pred_letter
-        s["last_confidence"]  = confidence
 
-    # ── Word formation logic ──────────────────────────────────────────────
-    if hand_present and confidence >= CONF_THRESHOLD:
-        s["last_hand_time"]    = now
-        s["letter_just_added"] = False
+def speak(text: str) -> None:
+    try:
+        import pyttsx3
 
-        if pred_letter == s["current_letter"]:
-            if s["stable_since"] is None:
-                s["stable_since"] = now
-            elif (now - s["stable_since"]) >= STABILITY_TIME and not s["letter_just_added"]:
-                s["current_sentence"]  += pred_letter
-                s["letter_just_added"]  = True
-                s["stable_since"]       = now
-                print(f"Letter: {pred_letter} | Sentence: {s['current_sentence']}")
-        else:
-            s["current_letter"]    = pred_letter
-            s["stable_since"]      = None
-            s["letter_just_added"] = False
+        with runtime.tts_lock:
+            runtime.tts_busy = True
+            engine = pyttsx3.init()
+            engine.setProperty("rate", 160)
+            engine.say(text)
+            engine.runAndWait()
+            engine.stop()
+    except Exception:
+        LOGGER.exception("Text-to-speech failed")
+    finally:
+        runtime.tts_busy = False
 
-    elif not hand_present:
-        if (now - s["last_hand_time"]) >= SPACE_TIME and not s["letter_just_added"]:
-            if s["current_sentence"] and not s["current_sentence"].endswith(" "):
-                s["current_sentence"]  += " "
-                s["letter_just_added"]  = True
-        s["current_letter"] = ""
-        s["stable_since"]   = None
 
-    # ── Progress bar value (0.0 – 1.0) ───────────────────────────────────
-    progress = 0.0
-    if s["stable_since"] and hand_present and confidence >= CONF_THRESHOLD:
-        progress = min((now - s["stable_since"]) / STABILITY_TIME, 1.0)
+def record_and_transcribe() -> None:
+    with runtime.stt_lock:
+        try:
+            import sounddevice as sd
+            from faster_whisper import WhisperModel
 
-    return {
-        "hand_present"     : hand_present,
-        "pred_letter"      : pred_letter if hand_present and confidence >= CONF_THRESHOLD else "",
-        "confidence"       : round(confidence * 100, 1) if hand_present else 0,
-        "current_sentence" : s["current_sentence"],
-        "progress"         : round(progress, 3),
-        "edge_density"     : round(edge_density, 4),
-    }
+            runtime.stt_status = "recording"
+            audio = sd.rec(6 * 16_000, samplerate=16_000, channels=1, dtype="float32")
+            sd.wait()
+            runtime.stt_status = "processing"
+            if runtime.whisper is None:
+                runtime.whisper = WhisperModel(
+                    os.getenv("SIGNBRIDGE_WHISPER_MODEL", "small"), compute_type="int8"
+                )
+            samples = audio.flatten()
+            peak = float(np.max(np.abs(samples)))
+            if peak > 1e-4:
+                samples = samples * min(0.95 / peak, 8.0)
+            segments, _ = runtime.whisper.transcribe(
+                samples,
+                language=os.getenv("SIGNBRIDGE_SPEECH_LANGUAGE", "en"),
+                beam_size=5,
+                temperature=0.0,
+                vad_filter=True,
+                condition_on_previous_text=False,
+            )
+            runtime.stt_result = " ".join(s.text for s in segments).strip()
+            runtime.stt_error = ""
+            runtime.stt_status = "done"
+        except Exception as exc:
+            runtime.stt_error = str(exc)
+            runtime.stt_status = "error"
+            LOGGER.exception("Speech recognition failed")
 
-# ─── HTTP endpoints ───────────────────────────────────────────────────────────
 
 @app.get("/status")
-def status():
-    return {"status": "online", "model": "sign_model_grey", "classes": len(le.classes_)}
+def status() -> dict:
+    model_ready = runtime.model is not None and runtime.encoder is not None
+    hand_tracking_ready = runtime.hand_detector is not None
+    ready = model_ready and hand_tracking_ready
+    return {
+        "status": "online" if ready else "degraded",
+        "recognition_ready": ready,
+        "model_ready": model_ready,
+        "hand_tracking_ready": hand_tracking_ready,
+        "model": MODEL_PATH.name,
+        "recognition_mode": "alphabet_static_cnn",
+        "planned_mode": "30_frame_holistic_lstm_full_words",
+        "classes": len(runtime.encoder.classes_) if ready else 0,
+        "error": runtime.model_error,
+    }
 
 
 @app.post("/tts")
-async def tts(body: dict):
-    """Body: {"text": "HELLO WORLD"}"""
-    text = body.get("text", "").strip()
+def tts(body: TextRequest) -> dict:
+    text = body.text.strip()
     if not text:
-        return JSONResponse({"ok": False, "error": "empty text"})
-    if tts_busy:
-        return JSONResponse({"ok": False, "error": "already speaking"})
-    threading.Thread(target=_speak, args=(text,), daemon=True).start()
+        raise HTTPException(status_code=422, detail="Text cannot be empty")
+    if runtime.tts_busy:
+        raise HTTPException(status_code=409, detail="Text-to-speech is already running")
+    Thread(target=speak, args=(text,), daemon=True).start()
     return {"ok": True, "speaking": text}
 
 
 @app.post("/stt/start")
-async def stt_start():
-    global stt_status, stt_result
-    if stt_status == "recording":
-        return {"ok": False, "error": "already recording"}
-    stt_result = ""
-    threading.Thread(target=_record_and_transcribe, daemon=True).start()
-    return {"ok": True, "status": "recording"}
+def stt_start() -> dict:
+    if runtime.stt_status in {"recording", "processing"}:
+        raise HTTPException(status_code=409, detail="Speech recognition is already running")
+    runtime.stt_result = ""
+    runtime.stt_error = ""
+    Thread(target=record_and_transcribe, daemon=True).start()
+    return {"ok": True, "status": "starting"}
 
 
 @app.get("/stt/result")
-async def stt_result_endpoint():
-    return {"status": stt_status, "result": stt_result}
+def stt_result() -> dict:
+    return {
+        "status": runtime.stt_status,
+        "result": runtime.stt_result,
+        "error": runtime.stt_error,
+    }
+
+
+@app.websocket("/ws/predict")
+async def websocket_predict(websocket: WebSocket) -> None:
+    await websocket.accept()
+    if runtime.model is None or runtime.encoder is None or runtime.hand_detector is None:
+        message = runtime.model_error or "MediaPipe hand tracking is unavailable"
+        await websocket.send_json({"type": "error", "message": message})
+        await websocket.close(code=1013)
+        return
+
+    smoother = PredictionSmoother()
+    try:
+        while True:
+            frame = decode_frame(await websocket.receive_text())
+            probabilities, hand_present = await asyncio.to_thread(predict_probabilities, frame)
+            if hand_present and probabilities is not None:
+                index, confidence, margin = smoother.update(probabilities)
+                letter = str(runtime.encoder.classes_[index])
+            else:
+                smoother.reset()
+                letter, confidence, margin = "", 0.0, 0.0
+            with runtime.state_lock:
+                result = runtime.words.update(letter, confidence, margin, hand_present)
+            result["type"] = "prediction"
+            await websocket.send_json(result)
+    except WebSocketDisconnect:
+        LOGGER.info("Prediction client disconnected")
+    except ValueError as exc:
+        await websocket.send_json({"type": "error", "message": str(exc)})
+        await websocket.close(code=1003)
+    except Exception:
+        LOGGER.exception("Prediction WebSocket failed")
+        await websocket.close(code=1011)
 
 
 @app.post("/clear")
-async def clear_sentence():
-    wf_state["current_sentence"]   = ""
-    wf_state["current_letter"]     = ""
-    wf_state["stable_since"]       = None
-    wf_state["letter_just_added"]  = False
-    return {"ok": True}
+def clear_hint() -> dict:
+    with runtime.state_lock:
+        runtime.words.clear()
+    return {"ok": True, "sentence": ""}
 
 
 @app.post("/backspace")
-async def backspace():
-    s = wf_state
-    if s["current_sentence"]:
-        s["current_sentence"] = s["current_sentence"][:-1]
-    return {"ok": True, "sentence": s["current_sentence"]}
+def backspace_hint() -> dict:
+    with runtime.state_lock:
+        sentence = runtime.words.backspace()
+    return {"ok": True, "sentence": sentence}
 
 
-# ─── WebSocket — main prediction loop ────────────────────────────────────────
-@app.websocket("/ws/predict")
-async def websocket_predict(ws: WebSocket):
-    """
-    Frontend se base64 JPEG frames aate hain.
-    Backend prediction + sentence state JSON mein bhejta hai.
-    """
-    await ws.accept()
-    print("WebSocket connected.")
-    frame_count = 0
-
-    try:
-        while True:
-            data = await ws.receive_text()
-
-            # base64 decode → numpy array
-            header, encoded = data.split(",", 1)
-            img_bytes = base64.b64decode(encoded)
-            np_arr    = np.frombuffer(img_bytes, np.uint8)
-            frame     = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-            if frame is None:
-                continue
-
-            frame_count += 1
-
-            # Har 3rd frame pe predict (same as week3/4)
-            if frame_count % 3 == 0:
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None, process_frame, frame
-                )
-                await ws.send_json(result)
-
-    except WebSocketDisconnect:
-        print("WebSocket disconnected.")
-    except Exception as e:
-        print(f"WebSocket error: {e}")
-
-
-# ─── Run ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("backend:app", host="0.0.0.0", port=8000, reload=False)
+    import uvicorn
+
+    uvicorn.run("backend:app", host="127.0.0.1", port=8000, reload=False)

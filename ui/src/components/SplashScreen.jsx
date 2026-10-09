@@ -6,15 +6,15 @@ import LogoAnimation from "./splash/LogoAnimation";
 import LoadingPanel from "./splash/LoadingPanel";
 import StatusBar from "./splash/StatusBar";
 
-export default function SplashScreen({ onFinish }) {
-  const loadingMessages = [
-    "Booting Gesturio Core...",
-    "Loading AI Neural Engine...",
-    "Initializing Gesture Models...",
-    "Calibrating Camera Input...",
-    "Establishing Secure Session..."
-  ];
+const loadingMessages = [
+  "Starting SignBridge…",
+  "Loading recognition engine…",
+  "Preparing gesture model…",
+  "Calibrating camera input…",
+  "Almost ready…",
+];
 
+export default function SplashScreen({ onFinish }) {
   const [messageIndex, setMessageIndex] = useState(0);
   const [progress, setProgress] = useState(0);
   const [exiting, setExiting] = useState(false);
@@ -59,11 +59,11 @@ export default function SplashScreen({ onFinish }) {
         <LogoAnimation />
 
         <h1 className="mt-10 text-6xl font-black tracking-[10px] text-white">
-          GESTURIO
+          SIGNBRIDGE
         </h1>
 
         <p className="text-muted mt-3 text-sm">
-          AI Gesture Recognition System
+          Bi-directional Sign Language Communication
         </p>
 
         {/* Status */}

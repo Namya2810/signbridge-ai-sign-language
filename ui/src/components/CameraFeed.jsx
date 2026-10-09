@@ -1,119 +1,134 @@
-import { useEffect, useRef, useCallback } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import Webcam from "react-webcam";
-import { FaVideo, FaExpand } from "react-icons/fa";
+import { FaCamera, FaExpand } from "react-icons/fa";
 
-/**
- * CameraFeed — webcam frames ko backend WebSocket pe bhejta hai.
- * onPrediction(result) callback se parent ko data milta hai.
- */
-export default function CameraFeed({ onPrediction }) {
+const API_URL = import.meta.env.VITE_API_URL || "http://127.0.0.1:8000";
+const WS_URL = API_URL.replace(/^http/, "ws");
+
+export default function CameraFeed({ onPrediction, onConnectionChange }) {
   const webcamRef = useRef(null);
-  const wsRef     = useRef(null);
-  const timerRef  = useRef(null);
+  const containerRef = useRef(null);
+  const wsRef = useRef(null);
+  const sendTimerRef = useRef(null);
+  const reconnectRef = useRef(null);
+  const mountedRef = useRef(false);
+  const predictionRef = useRef(onPrediction);
+  const connectionRef = useRef(onConnectionChange);
+  const [status, setStatus] = useState("connecting");
+  const [message, setMessage] = useState("Starting camera and AI engine…");
 
-  // ── WebSocket connect ──────────────────────────────────────────────────
   useEffect(() => {
+    predictionRef.current = onPrediction;
+    connectionRef.current = onConnectionChange;
+  }, [onPrediction, onConnectionChange]);
+
+  const updateStatus = useCallback((next, detail) => {
+    setStatus(next);
+    setMessage(detail);
+    connectionRef.current?.(next);
+  }, []);
+
+  useEffect(() => {
+    mountedRef.current = true;
+
+    const stopSending = () => {
+      window.clearInterval(sendTimerRef.current);
+      sendTimerRef.current = null;
+    };
+
     const connect = () => {
-      const ws = new WebSocket("ws://localhost:8000/ws/predict");
+      if (!mountedRef.current) return;
+      updateStatus("connecting", "Connecting to recognition service…");
+      const ws = new WebSocket(`${WS_URL}/ws/predict`);
+      wsRef.current = ws;
 
       ws.onopen = () => {
-        console.log("WS connected");
-        wsRef.current = ws;
-        startSending();
+        if (!mountedRef.current) return;
+        updateStatus("online", "Live recognition ready");
+        stopSending();
+        sendTimerRef.current = window.setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN || ws.bufferedAmount > 250_000) return;
+          const image = webcamRef.current?.getScreenshot();
+          if (image) ws.send(image);
+        }, 140);
       };
 
-      ws.onmessage = (e) => {
-        const result = JSON.parse(e.data);
-        if (onPrediction) onPrediction(result);
+      ws.onmessage = ({ data }) => {
+        try {
+          const result = JSON.parse(data);
+          if (result.type === "error") {
+            updateStatus("error", result.message || "Recognition service error");
+            return;
+          }
+          predictionRef.current?.(result);
+        } catch {
+          updateStatus("error", "Received an invalid recognition response");
+        }
       };
 
+      ws.onerror = () => ws.close();
       ws.onclose = () => {
-        console.log("WS closed, reconnecting in 2s...");
-        clearInterval(timerRef.current);
-        setTimeout(connect, 2000);
-      };
-
-      ws.onerror = (err) => {
-        console.error("WS error", err);
-        ws.close();
+        stopSending();
+        if (!mountedRef.current) return;
+        updateStatus("offline", "Backend offline — retrying…");
+        reconnectRef.current = window.setTimeout(connect, 2500);
       };
     };
 
     connect();
-
     return () => {
-      clearInterval(timerRef.current);
+      mountedRef.current = false;
+      stopSending();
+      window.clearTimeout(reconnectRef.current);
       wsRef.current?.close();
     };
-  }, []);
+  }, [updateStatus]);
 
-  // ── Frame sender — har 100ms (10 fps to backend) ──────────────────────
-  const startSending = useCallback(() => {
-    timerRef.current = setInterval(() => {
-      if (
-        webcamRef.current &&
-        wsRef.current?.readyState === WebSocket.OPEN
-      ) {
-        const imageSrc = webcamRef.current.getScreenshot();
-        if (imageSrc) {
-          wsRef.current.send(imageSrc);
-        }
-      }
-    }, 100);
-  }, []);
+  const enterFullscreen = () => containerRef.current?.requestFullscreen?.();
+  const statusColor = {
+    online: "bg-emerald-400",
+    connecting: "bg-amber-400",
+    offline: "bg-rose-400",
+    error: "bg-rose-400",
+  }[status];
 
   return (
-    <div className="relative glass rounded-2xl overflow-hidden h-[550px] border border-white/10 animate-float-soft animate-glow">
-
-      {/* TOP HUD BAR */}
-      <div className="absolute top-0 left-0 w-full z-10 flex items-center justify-between px-4 py-3 bg-black/20 backdrop-blur-md">
-        <div className="flex items-center gap-2 text-emerald-400 text-sm">
-          <FaVideo />
-          <span>AI Vision System</span>
-        </div>
-        <div className="flex items-center gap-2 text-xs text-muted">
-          <span className="w-2 h-2 bg-emerald-400 rounded-full animate-soft-pulse"></span>
-          ACTIVE
-        </div>
-      </div>
-
-      {/* Webcam */}
+    <section ref={containerRef} className="camera-shell" aria-label="Live sign recognition camera">
       <Webcam
         ref={webcamRef}
         audio={false}
+        mirrored
         screenshotFormat="image/jpeg"
-        screenshotQuality={0.7}
-        className="w-full h-full object-cover scale-[1.03]"
-        mirrored={true}
+        screenshotQuality={0.78}
+        videoConstraints={{ width: 960, height: 720, facingMode: "user" }}
+        className="h-full w-full object-cover"
+        onUserMediaError={() => updateStatus("error", "Camera permission is required")}
       />
 
-      {/* SCANNING GRID OVERLAY */}
-      <div className="absolute inset-0 pointer-events-none">
-        <div
-          className="absolute inset-0 opacity-10"
-          style={{
-            backgroundImage:
-              "linear-gradient(rgba(255,255,255,0.2) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,0.2) 1px, transparent 1px)",
-            backgroundSize: "40px 40px",
-          }}
-        />
-        <div className="absolute w-full h-1 bg-gradient-to-r from-transparent via-emerald-400 to-transparent opacity-70 animate-pulse top-1/2" />
+      <div className="camera-topbar">
+        <div className="flex items-center gap-2.5">
+          <FaCamera className="text-emerald-300" aria-hidden="true" />
+          <div>
+            <p className="text-sm font-semibold text-white">Recognition camera</p>
+            <p className="text-xs text-slate-300">Keep the complete hand sign inside the guide</p>
+          </div>
+        </div>
+        <button className="icon-button" onClick={enterFullscreen} aria-label="Open camera fullscreen">
+          <FaExpand />
+        </button>
       </div>
 
-      {/* CORNER FRAME GLOW */}
-      <div className="absolute inset-0 pointer-events-none shadow-[inset_0_0_80px_rgba(34,197,94,0.18)]" />
-
-      {/* BOTTOM STATUS BAR */}
-      <div className="absolute bottom-0 left-0 w-full px-4 py-3 bg-black/20 backdrop-blur-md flex justify-between text-xs text-muted">
-        <span>Gesture Tracking: ON</span>
-        <span className="text-emerald-400">Neural Model: v2.1</span>
+      <div className="hand-guide" aria-hidden="true">
+        <span className="guide-corner guide-tl" />
+        <span className="guide-corner guide-tr" />
+        <span className="guide-corner guide-bl" />
+        <span className="guide-corner guide-br" />
       </div>
 
-      {/* FULLSCREEN ICON */}
-      <div className="absolute top-3 right-12 text-white/60 hover:text-white cursor-pointer">
-        <FaExpand />
+      <div className="camera-status" role="status">
+        <span className={`h-2 w-2 rounded-full ${statusColor} ${status === "online" ? "animate-pulse" : ""}`} />
+        <span>{message}</span>
       </div>
-
-    </div>
+    </section>
   );
 }

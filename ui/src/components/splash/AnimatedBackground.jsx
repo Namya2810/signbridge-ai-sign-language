@@ -1,5 +1,12 @@
 import { motion } from "framer-motion";
 
+const stars = Array.from({ length: 70 }, (_, index) => ({
+  size: 1 + ((index * 17) % 30) / 10,
+  top: `${(index * 37) % 100}%`,
+  left: `${(index * 61) % 100}%`,
+  duration: 2 + ((index * 13) % 30) / 10,
+}));
+
 export default function AnimatedBackground() {
   return (
     <div className="absolute inset-0 overflow-hidden">
@@ -40,21 +47,21 @@ export default function AnimatedBackground() {
       <div className="absolute inset-0 pointer-events-none bg-[linear-gradient(transparent_50%,rgba(255,255,255,.02)_50%)] bg-[length:100%_6px]" />
 
       {/* Stars */}
-      {Array.from({ length: 70 }).map((_, i) => (
+      {stars.map((star, i) => (
         <motion.span
           key={i}
           className="absolute rounded-full bg-white"
           style={{
-            width: Math.random() * 3 + 1,
-            height: Math.random() * 3 + 1,
-            top: `${Math.random() * 100}%`,
-            left: `${Math.random() * 100}%`,
+            width: star.size,
+            height: star.size,
+            top: star.top,
+            left: star.left,
           }}
           animate={{
             opacity: [0.2, 1, 0.2],
           }}
           transition={{
-            duration: 2 + Math.random() * 3,
+            duration: star.duration,
             repeat: Infinity,
           }}
         />

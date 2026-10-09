@@ -1,125 +1,95 @@
-import { useState, useEffect } from "react";
+import { useEffect, useState } from "react";
 
-/**
- * SignDisplay — current sentence ke letters ka slideshow.
- * Har letter ki sign image dikhata hai ek ek karke.
- * Images: /sign_images/A.png, B.png ... 0.png, 1.png etc.
- *
- * Props:
- *   sentence  — string, e.g. "HELLO"
- *   autoPlay  — bool, auto-advance karo (default true)
- *   interval  — ms per letter (default 1000)
- */
-export default function SignDisplay({ sentence = "", autoPlay = true, interval = 1000 }) {
+export default function SignDisplay({ sentence = "", autoPlay = true, interval = 1000, compact = false }) {
   const [currentIndex, setCurrentIndex] = useState(0);
-
-  // Sentence se letters nikalo (spaces skip karo)
-  const letters = sentence
+  const [failedImage, setFailedImage] = useState(null);
+  const [paused, setPaused] = useState(!autoPlay);
+  const [speed, setSpeed] = useState(1);
+  const words = sentence
     .toUpperCase()
-    .split("")
-    .filter((ch) => ch !== " " && ch.match(/[A-Z0-9]/));
-
+    .trim()
+    .split(/\s+/)
+    .map((word) => [...word].filter((character) => /[A-Z0-9]/.test(character)))
+    .filter((word) => word.length > 0);
+  const letters = words.flat();
   const total = letters.length;
+  const safeIndex = total ? currentIndex % total : 0;
 
-  // Reset when sentence changes
+  let traversed = 0;
+  let currentWordIndex = 0;
+  let currentIndexInWord = 0;
+  for (let index = 0; index < words.length; index += 1) {
+    if (safeIndex < traversed + words[index].length) {
+      currentWordIndex = index;
+      currentIndexInWord = safeIndex - traversed;
+      break;
+    }
+    traversed += words[index].length;
+  }
+  const currentWord = words[currentWordIndex] || [];
+
   useEffect(() => {
-    setCurrentIndex(0);
-  }, [sentence]);
+    if (!autoPlay || paused || total < 2) return undefined;
+    const timer = window.setInterval(
+      () => setCurrentIndex((previous) => (previous + 1) % total),
+      interval / speed,
+    );
+    return () => window.clearInterval(timer);
+  }, [autoPlay, paused, total, interval, speed]);
 
-  // Auto-play slideshow
-  useEffect(() => {
-    if (!autoPlay || total === 0) return;
-
-    const timer = setInterval(() => {
-      setCurrentIndex((prev) => (prev + 1) % total);
-    }, interval);
-
-    return () => clearInterval(timer);
-  }, [autoPlay, total, interval]);
-
-  const currentLetter = letters[currentIndex] ?? null;
-  const imgSrc = currentLetter ? `/sign_images/${currentLetter}.png` : null;
+  const currentLetter = letters[safeIndex] ?? null;
+  const imageName = currentLetter?.toUpperCase();
 
   return (
-    <div className="glass rounded-2xl border border-white/10 p-4 flex flex-col items-center gap-3">
-
-      {/* Header */}
-      <div className="w-full flex items-center justify-between">
-        <p className="text-xs text-muted">Sign Reference</p>
-        {total > 0 && (
-          <p className="text-xs text-emerald-400">
-            {currentIndex + 1} / {total}
-          </p>
-        )}
-      </div>
-
-      {/* Image display */}
-      <div className="w-full aspect-square bg-slate-800/60 rounded-xl overflow-hidden flex items-center justify-center border border-slate-700/50 relative">
-        {imgSrc ? (
-          <>
+    <section className={`sign-player ${compact ? "sign-player-compact" : ""}`}>
+      <header><p>Sign playback</p>{total > 0 && <span>{safeIndex + 1} / {total}</span>}</header>
+      <div className="sign-stage">
+        {currentLetter ? <>
+          {failedImage !== imageName ? (
             <img
-              key={currentLetter}
-              src={imgSrc}
+              src={`/sign_images/${imageName}.png`}
               alt={`Sign for ${currentLetter}`}
-              className="w-full h-full object-contain p-2 animate-fade-in"
-              onError={(e) => {
-                e.target.style.display = "none";
-              }}
+              onError={() => setFailedImage(imageName)}
             />
-            {/* Letter overlay */}
-            <div className="absolute bottom-2 right-2 bg-black/60 rounded-lg px-2 py-1">
-              <span className="text-emerald-400 font-bold text-lg">
-                {currentLetter}
-              </span>
-            </div>
-          </>
-        ) : (
-          <div className="flex flex-col items-center gap-2">
-            <span className="text-4xl">🤟</span>
-            <p className="text-muted text-xs text-center">
-              {sentence ? "Loading..." : "Sign something\nto see reference"}
-            </p>
-          </div>
-        )}
+          ) : (
+            <div className="sign-placeholder"><span aria-hidden="true">🤟</span><p>Reference image unavailable</p></div>
+          )}
+          <strong>{currentLetter}</strong>
+        </> : <div className="sign-placeholder"><span aria-hidden="true">🤟</span><p>Speak to start sign playback</p></div>}
       </div>
-
-      {/* Letter strip — all letters in sentence */}
       {total > 0 && (
-        <div className="w-full flex flex-wrap gap-1 justify-center">
-          {letters.map((letter, i) => (
-            <button
-              key={i}
-              onClick={() => setCurrentIndex(i)}
-              className={`w-7 h-7 rounded-md text-xs font-bold transition-all
-                ${i === currentIndex
-                  ? "bg-emerald-500 text-white scale-110"
-                  : "bg-slate-700 text-slate-300 hover:bg-slate-600"
-                }`}
-            >
-              {letter}
-            </button>
-          ))}
+        <div className="sign-player-details">
+          <p className="sign-word-label">Word {currentWordIndex + 1} of {words.length}</p>
+          <div className="sign-sequence" aria-label={`Current word ${currentWord.join("")}`}>
+            {currentWord.map((letter, index) => (
+              <button
+                key={`${letter}-${index}`}
+                onClick={() => setCurrentIndex(traversed + index)}
+                aria-label={`Show sign for ${letter}`}
+                className={index === currentIndexInWord ? "active" : ""}
+              >{letter}</button>
+            ))}
+          </div>
+          <div className="sign-progress" aria-label={`${safeIndex + 1} of ${total}`}>
+            <i style={{ width: `${((safeIndex + 1) / total) * 100}%` }} />
+          </div>
+          <div className="sign-navigation">
+            <button onClick={() => setCurrentIndex((previous) => (previous - 1 + total) % total)}>← Previous</button>
+            <button className="play-toggle" onClick={() => setPaused((value) => !value)}>{paused ? "▶ Play" : "Ⅱ Pause"}</button>
+            <button onClick={() => setCurrentIndex((previous) => (previous + 1) % total)}>Next →</button>
+          </div>
+          <div className="sign-player-options">
+            <button onClick={() => { setCurrentIndex(0); setPaused(false); }}>↻ Replay</button>
+            <label>Speed
+              <select value={speed} onChange={(event) => setSpeed(Number(event.target.value))}>
+                <option value={0.75}>0.75×</option>
+                <option value={1}>1×</option>
+                <option value={1.5}>1.5×</option>
+              </select>
+            </label>
+          </div>
         </div>
       )}
-
-      {/* Manual controls */}
-      {total > 1 && (
-        <div className="flex gap-3">
-          <button
-            onClick={() => setCurrentIndex((prev) => (prev - 1 + total) % total)}
-            className="text-xs px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-white transition"
-          >
-            ← Prev
-          </button>
-          <button
-            onClick={() => setCurrentIndex((prev) => (prev + 1) % total)}
-            className="text-xs px-3 py-1 rounded-lg bg-slate-700 hover:bg-slate-600 text-white transition"
-          >
-            Next →
-          </button>
-        </div>
-      )}
-
-    </div>
+    </section>
   );
 }

@@ -1,8 +1,34 @@
+# Python
 __pycache__/
 *.py[cod]
+*.pyo
+.pytest_cache/
+.coverage
+htmlcov/
 .venv/
 venv/
-ui/node_modules/
-ui/dist/
+
+# Runtime and generated data
 recorded.wav
 *.log
+landmark_data/
+
+# Frontend
+ui/node_modules/
+ui/dist/
+ui/.vite/
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Local configuration
+.env
+ui/.env
+!.env.example
+!ui/.env.example
+
+# Large training dataset (not committed)
+isl_dataset/

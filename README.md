@@ -1,52 +1,90 @@
-# SignBridge — AI Sign Language Translator
+# SignBridge
 
-SignBridge is a multimodal accessibility application for real-time sign-language recognition, word formation, text-to-speech, and speech-to-text. A React dashboard streams webcam frames to a FastAPI WebSocket backend, where a trained CNN recognizes hand signs.
+SignBridge is a local Indian Sign Language assistant. A React camera interface sends frames to a FastAPI backend, which recognizes letters, forms words, converts signed text to speech, and can transcribe spoken audio for sign-reference playback.
 
-## Features
+## Current status versus the final plan
 
-- Real-time webcam sign recognition over WebSockets
-- Trained TensorFlow/Keras sign classifiers
-- Letter-to-word formation with confidence scores
-- Text-to-speech output
-- Whisper-based speech-to-text
-- Responsive React dashboard
-- Dataset collection and model-training utilities
+The included `sign_model_grey.keras` is a static 36-class alphabet/number CNN. It is **Phase 1**, not the final dynamic-word model described in the project write-up. The interface labels this honestly as **Alphabet prototype**.
 
-## Architecture
+The final documented target is a privacy-first, bi-directional conversation system using MediaPipe Holistic landmarks and a 30-frame LSTM sequence model for full-word gestures. Completing that phase requires collecting labelled landmark sequences and training/exporting a new sequence model; those sequence datasets and models are not part of this repository yet.
 
-```text
-React + webcam -> WebSocket -> FastAPI -> TensorFlow model
-                                      -> recognized text -> TTS
-Microphone -> Faster Whisper -> speech transcript
+## What was improved
+
+- MediaPipe hand-landmark gating and cropping; prediction is paused when no real hand is detected
+- Seven-frame probability smoothing and top-class confidence-margin filtering
+- Stable-letter acceptance that prevents accidental repeated characters
+- Per-pause spacing, clear, and backspace controls
+- Model paths resolved from the project folder with shape/class validation
+- Lazy loading for speech recognition and text-to-speech
+- Graceful degraded backend status instead of startup crashes
+- Responsive camera, dashboard, status, and touch-friendly controls
+
+## Requirements
+
+- Windows 10 or 11
+- Python 3.12 (64-bit)
+- Node.js 20 or newer
+- Webcam and microphone permissions
+
+The included model expects `64 × 64 × 3` images and produces 36 classes (A–Z and 0–9).
+
+## First-time setup
+
+Open PowerShell in this folder and run:
+
+```powershell
+Set-ExecutionPolicy -Scope Process Bypass
+.\scripts\setup.ps1
 ```
 
-## Run locally
+The setup creates `.venv`, installs Python packages, and installs the frontend packages.
 
-### Backend
+## Start the application
 
-```bash
-python -m venv .venv
-.venv\\Scripts\\activate
-pip install -r requirements.txt
-python backend.py
+```powershell
+.\scripts\start.ps1
 ```
 
-The API starts at `http://localhost:8000`.
+Then open `http://127.0.0.1:5173`. Keep the backend window open while using the app.
 
-### Frontend
+You can also launch the two services separately:
 
-```bash
-cd ui
-npm install
-npm run dev
+```powershell
+.\scripts\start-backend.ps1
+.\scripts\start-frontend.ps1
 ```
 
-Open `http://localhost:5173` and allow camera/microphone access.
+## Recognition tips
 
-## Models
+1. Use an evenly lit background with your hand clearly separated from it.
+2. Keep one hand inside the on-screen guide.
+3. Hold a sign steadily until the progress indicator completes.
+4. Change or briefly lower your hand before signing the same letter twice.
+5. Lower your hand briefly to insert a space.
+6. Lower your hand for five seconds to complete the draft automatically, or use **Complete & Speak** immediately.
 
-The repository includes the trained CNN model and label encoder needed by `backend.py`. `backend_mediapipe.py` is an experimental landmark-classifier variant and requires separately trained `landmark_classifier.pkl` and `landmark_encoder.pkl` artifacts.
+## Conversation flow
 
-## Notes
+- Camera gestures build a live draft beside the video.
+- **Complete & Speak** adds the draft as a signed-message chat bubble and reads it aloud.
+- A five-second no-hand pause completes the same action automatically.
+- **Speak** records a six-second microphone message and adds the transcription as a spoken-message bubble.
+- The sign playback panel shows that spoken message character-by-character at one-second intervals and loops until it is closed or replaced by the next spoken message.
 
-The first backend launch downloads the Faster Whisper `small` model. Windows SAPI is used by the included text-to-speech configuration.
+## Configuration
+
+Copy `.env.example` values into your shell environment when custom paths or settings are needed. Copy `ui/.env.example` to `ui/.env` to point the interface at a backend on another host.
+
+The backend health endpoint is `http://127.0.0.1:8000/status`. A `degraded` response includes the model-loading error so setup problems are visible without crashing the server.
+
+## Project layout
+
+- `backend.py` — API, WebSocket, model lifecycle, speech features
+- `recognition.py` — image preprocessing, temporal smoothing, word formation
+- `ui/` — React and Vite interface
+- `tools/` — optional landmark data collection and classifier training
+- `docs/` — project plan and original write-up
+- `tests/` — recognition state-machine tests
+- `scripts/` — setup and launch scripts
+- `sign_model_grey.keras` / `label_encoder_grey.pkl` — active recognition assets
+- `isl_dataset/` — local-only training images (about 2.4 GB, 90,000 files; not committed, see `.gitignore`). `tools/train_classifier.py` expects it when retraining.
