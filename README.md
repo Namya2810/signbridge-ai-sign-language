@@ -87,4 +87,4 @@ The backend health endpoint is `http://127.0.0.1:8000/status`. A `degraded` resp
 - `tests/` — recognition state-machine tests
 - `scripts/` — setup and launch scripts
 - `sign_model_grey.keras` / `label_encoder_grey.pkl` — active recognition assets
-- `isl_dataset/` — local-only training images (about 2.4 GB, 90,000 files; not committed, see `.gitignore`). `tools/train_classifier.py` expects it when retraining.
+- `isl_dataset/` — local-only training images (about 2.4 GB, 90,000 files; not committed, see `.gitignore`). It is not needed to run the app. `tools/collect_data.py` and `tools/train_classifier.py` use `landmark_data/landmarks.csv` (also not committed) instead.
